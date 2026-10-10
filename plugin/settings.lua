@@ -40,11 +40,16 @@ function M.new_rejection(now)
   }
 end
 
--- Bridge state ("connecting" | "connected" | "rejected") -> Server text, Bridge text.
+-- The Server retries its port bind for 15 s, then exits; an orphan's watchdog ends it within 10 s.
+-- So a Bridge still connecting after this long (seconds) means no Server is running.
+M.START_WINDOW = 20
+
+-- Bridge state ("connecting" | "connected" | "rejected") and seconds spent in it -> Server text, Bridge text.
 -- The Plugin cannot probe the Server directly: a live Bridge is the only proof it runs.
-function M.describe(state)
+function M.describe(state, elapsed)
   if state == "connected" then return "running", "connected" end
   if state == "rejected" then return "owned by another Aseprite instance", "rejected (401)" end
+  if (elapsed or 0) >= M.START_WINDOW then return "not running (port in use? see server.log)", "connecting" end
   return "starting", "connecting"
 end
 

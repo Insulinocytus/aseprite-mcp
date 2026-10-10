@@ -45,8 +45,10 @@ assert(not settings.is_unauthorized("Connection refused ws://127.0.0.1:40101/ws?
 
 local s, b = settings.describe("connected")
 assert(s == "running" and b == "connected")
-s, b = settings.describe("connecting")
+s, b = settings.describe("connecting", 0)
 assert(s == "starting" and b == "connecting")
+s, b = settings.describe("connecting", settings.START_WINDOW)
+assert(s:find("not running", 1, true) and b == "connecting", s)
 s, b = settings.describe("rejected")
 assert(s == "owned by another Aseprite instance" and b == "rejected (401)")
 

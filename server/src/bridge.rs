@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub enum CallError {
     NotConnected,
+    /// The Bridge closed while the call was in flight; the Plugin may or may not have run it.
+    Disconnected,
     Timeout,
 }
 
@@ -25,6 +27,9 @@ impl fmt::Display for CallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => f.write_str("Aseprite is not connected: open Aseprite with the MCP extension installed"),
+            Self::Disconnected => {
+                f.write_str("Aseprite disconnected during the call; the Lua code may or may not have run")
+            }
             Self::Timeout => f.write_str("timed out; the Lua code may still be running in Aseprite"),
         }
     }
@@ -42,7 +47,8 @@ pub struct Hub {
     shutdown: CancellationToken,
     /// (connection id, outgoing text frames) of the current Bridge.
     bridge: Mutex<Option<(u64, mpsc::UnboundedSender<String>)>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
+    /// Waiting calls by id, tagged with the connection they were sent on.
+    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<Reply>)>>,
     next_id: AtomicU64,
     /// Held for a whole call so only one call is in flight toward the Plugin; the rest queue here.
     gate: AsyncMutex<()>,
@@ -88,17 +94,19 @@ impl Hub {
             return Err(CallError::NotConnected);
         }
         let _turn = self.gate.lock().await;
-        let tx = self.bridge.lock().as_ref().map(|(_, tx)| tx.clone()).ok_or(CallError::NotConnected)?;
+        let (conn, tx) = self.bridge.lock().clone().ok_or(CallError::NotConnected)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.pending.lock().insert(id, reply_tx);
+        self.pending.lock().insert(id, (conn, reply_tx));
         if tx.send(json!({ "id": id, "tool": tool, "args": args }).to_string()).is_err() {
             self.pending.lock().remove(&id);
             return Err(CallError::NotConnected);
         }
         match tokio::time::timeout(self.call_timeout, reply_rx).await {
             Ok(Ok(reply)) => Ok(reply),
-            _ => {
+            // The connection ended and dropped our waiter: no reply can come any more.
+            Ok(Err(_)) => Err(CallError::Disconnected),
+            Err(_) => {
                 // A late reply finds no pending entry and is dropped.
                 self.pending.lock().remove(&id);
                 Err(CallError::Timeout)
@@ -131,11 +139,15 @@ impl Hub {
             }
         }
 
-        let mut bridge = self.bridge.lock();
-        if matches!(&*bridge, Some((c, _)) if *c == conn) {
-            *bridge = None;
-            self.connected.send_replace(false);
+        {
+            let mut bridge = self.bridge.lock();
+            if matches!(&*bridge, Some((c, _)) if *c == conn) {
+                *bridge = None;
+                self.connected.send_replace(false);
+            }
         }
+        // Calls sent on this connection can never be answered: fail them now, not after the timeout.
+        self.pending.lock().retain(|_, (c, _)| *c != conn);
         self.log("bridge disconnected");
     }
 
@@ -170,7 +182,7 @@ impl Hub {
     fn deliver(&self, msg: Value, bytes: Vec<u8>) {
         let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
         match self.pending.lock().remove(&id) {
-            Some(waiter) => {
+            Some((_, waiter)) => {
                 let _ = waiter.send(Reply { msg, bytes });
             }
             None => self.log(format!("dropping reply for unknown or timed-out call {id}")),

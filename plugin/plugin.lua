@@ -5,6 +5,7 @@ local executor
 local settings
 local ws
 local state = "connecting" -- Bridge state, see settings.describe
+local state_since = os.time() -- when `state` last changed
 local dlg -- the open settings window, if any
 local port
 local rejected_alerted = false
@@ -27,7 +28,7 @@ end
 
 local function refresh()
   if not dlg then return end
-  local server, bridge = settings.describe(state)
+  local server, bridge = settings.describe(state, os.time() - state_since)
   dlg:modify { id = "server", text = server }
   dlg:modify { id = "bridge", text = bridge }
   dlg:modify { id = "url", text = settings.url(port) }
@@ -35,6 +36,8 @@ local function refresh()
 end
 
 local function set_state(s)
+  -- Reconnect errors repeat "connecting" every second or two: only a real change restarts the clock.
+  if s ~= state then state_since = os.time() end
   state = s
   refresh()
 end
@@ -85,6 +88,7 @@ local function start(plugin)
   }
   ws = socket
   state = "connecting"
+  state_since = os.time()
   ws:connect()
 end
 
@@ -104,7 +108,7 @@ end
 
 local function open_settings(plugin)
   if dlg then return end
-  local server, bridge = settings.describe(state)
+  local server, bridge = settings.describe(state, os.time() - state_since)
   dlg = Dialog {
     title = "MCP Server",
     onclose = function() dlg = nil end,

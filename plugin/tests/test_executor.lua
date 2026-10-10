@@ -120,6 +120,17 @@ test("mcp.sprite: active by default, by file name or path, error when missing", 
   assert(not r.ok and r.error:find("no active sprite", 1, true), tostring(r.error))
 end)
 
+test("mcp.sprite: same file name in two folders is an error by name, found by full path", function()
+  local a = new_sprite(); a.filename = "C:/tmp/one/same.aseprite"
+  local b = new_sprite(); b.filename = "C:/tmp/two/same.aseprite"
+  a.data, b.data = "A", "B"
+  local r = run("return mcp.sprite('same.aseprite')")
+  assert(not r.ok and r.error:find("several open sprites are named same.aseprite", 1, true), tostring(r.error))
+  r = run("return mcp.sprite('C:/tmp/two/same.aseprite').data")
+  assert(r.ok and r.result == "B", tostring(r.error))
+  b:close(); a:close()
+end)
+
 test("mcp.layer: top-level, nested group path, not-found errors", function()
   local s = new_sprite()
   local r = run([[

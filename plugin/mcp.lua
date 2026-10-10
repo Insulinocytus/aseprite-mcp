@@ -4,17 +4,21 @@ local mcp = {}
 
 local function basename(path) return (path:gsub("\\", "/"):match("([^/]*)$")) end
 
--- Sprite by file name or full path; no argument = active sprite. Raises when none matches.
+-- Sprite by full path, or by file name when exactly one open sprite has it; no argument = active sprite.
+-- Raises when none matches or a file name is ambiguous (app.sprites order is not reliable).
 function mcp.sprite(name)
   if name == nil then
     return app.sprite or error("no active sprite", 2)
   end
   local want = name:gsub("\\", "/")
+  local hits = {}
   for _, s in ipairs(app.sprites) do
     local f = s.filename:gsub("\\", "/")
-    if f == want or basename(f) == want then return s end
+    if f == want then return s end
+    if basename(f) == want then hits[#hits + 1] = s end
   end
-  error("sprite not found: " .. name, 2)
+  if #hits > 1 then error("several open sprites are named " .. name .. ": pass the full path", 2) end
+  return hits[1] or error("sprite not found: " .. name, 2)
 end
 
 -- Layer by "group/child" path (names), starting at the sprite's top level. Raises when a segment is missing.

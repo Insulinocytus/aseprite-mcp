@@ -22,7 +22,7 @@ Calling convention: `code` is the body of a Lua function, not a script file. `re
 With no open sprite the code still runs, just without an undo step.\n\
 \n\
 Helpers in the global `mcp` table (they raise an error when nothing matches):\n\
-- mcp.sprite(name?) -> Sprite: by file name or full path; omit for the active sprite.\n\
+- mcp.sprite(name?) -> Sprite: by file name or full path (a file name shared by several open sprites is an error: use the path); omit for the active sprite.\n\
 - mcp.layer(sprite, \"group/child\") -> Layer: path of layer names, nested groups separated by `/`.\n\
 - mcp.cel(layer, frame, create?) -> Cel: frame is a number; returns nil if the cel is missing, or makes an empty one when create=true.\n\
 - mcp.edit_image(cel, fn): fn(image) edits a clone of cel.image, which is then assigned back. \
@@ -42,7 +42,7 @@ Calling convention: `code` is the body of a Lua function, not a script file. `re
 `print(...)` output is captured and returned too. Errors return the message plus a Lua traceback.\n\
 \n\
 Helpers in the global `mcp` table (they raise an error when nothing matches):\n\
-- mcp.sprite(name?) -> Sprite: by file name or full path; omit for the active sprite.\n\
+- mcp.sprite(name?) -> Sprite: by file name or full path (a file name shared by several open sprites is an error: use the path); omit for the active sprite.\n\
 - mcp.layer(sprite, \"group/child\") -> Layer: path of layer names, nested groups separated by `/`.\n\
 - mcp.cel(layer, frame, create?) -> Cel: frame is a number; returns nil if the cel is missing (do not pass create here).\n\
 - mcp.edit_image(cel, fn): modifies pixels; run_lua only.\n\
@@ -125,8 +125,15 @@ impl Tools {
                     status["aseprite_version"] = reply["result"]["aseprite_version"].clone();
                     status["sprites"] = reply["result"]["sprites"].clone();
                 }
-                Ok(reply) => status["reason"] = json!(reply["error"].as_str().unwrap_or("unknown plugin error")),
-                Err(e) => status["reason"] = json!(e.to_string()),
+                Ok(reply) => {
+                    status["bridge_connected"] = json!(true);
+                    status["reason"] = json!(reply["error"].as_str().unwrap_or("unknown plugin error"));
+                }
+                // A timeout leaves the Bridge connected: report what the hub sees, not a blanket false.
+                Err(e) => {
+                    status["bridge_connected"] = json!(self.hub.is_connected());
+                    status["reason"] = json!(e.to_string());
+                }
             }
         }
         CallToolResult::success(vec![ContentBlock::text(status.to_string())])

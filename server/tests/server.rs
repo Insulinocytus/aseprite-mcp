@@ -445,6 +445,42 @@ async fn timed_out_call_reports_it_and_its_late_reply_is_dropped() {
 }
 
 #[tokio::test]
+async fn call_in_flight_fails_at_once_when_the_bridge_drops() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap(); // default 30 s call timeout
+    let mut plugin = connect_raw(&server).await;
+    let client = mcp_client(&server).await;
+    let _ = run_lua_when_connected(&client, &mut plugin).await;
+
+    let call = spawn_call(&client, "x");
+    let _ = recv_call(&mut plugin).await;
+    let t = Instant::now();
+    plugin.close(None).await.unwrap();
+    let result = call.await.unwrap();
+
+    assert!(t.elapsed() < Duration::from_secs(2), "waited {:?}", t.elapsed());
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("disconnected"), "{}", text(&result));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn get_status_after_timeout_still_reports_bridge_connected() {
+    let mut config = Config::new(0, TOKEN);
+    config.call_timeout = Duration::from_millis(300);
+    let server = Server::start(config).await.unwrap();
+    let mut plugin = connect_raw(&server).await;
+    let client = mcp_client(&server).await;
+    let _ = run_lua_when_connected(&client, &mut plugin).await;
+
+    // The raw Plugin never answers `status`, so the call times out while the Bridge stays up.
+    let status = get_status(&client).await;
+
+    assert_eq!(status["bridge_connected"], true, "{status}");
+    assert!(status["reason"].as_str().unwrap().contains("timed out"), "{status}");
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn tool_call_without_bridge_fails_at_once_with_open_aseprite_hint() {
     let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
     let client = mcp_client(&server).await;
