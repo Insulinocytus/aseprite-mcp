@@ -57,8 +57,27 @@ local function run_chunk(code, name, transactional)
   return { ok = false, error = tostring(failure or e) }
 end
 
+local COLOR_MODES = { [ColorMode.RGB] = "rgb", [ColorMode.GRAYSCALE] = "grayscale", [ColorMode.INDEXED] = "indexed" }
+
+-- Read-only: no transaction, so no undo step.
+local function status()
+  local sprites = {}
+  for i, s in ipairs(app.sprites) do
+    sprites[i] = {
+      filename = s.filename,
+      width = s.width,
+      height = s.height,
+      color_mode = COLOR_MODES[s.colorMode],
+      active = s == app.sprite,
+      modified = s.isModified,
+    }
+  end
+  return { ok = true, result = { aseprite_version = tostring(app.version), sprites = sprites } }
+end
+
 local handlers = {
   run_lua = function(args) return run_chunk(args.code, "run_lua", true) end,
+  status = status,
 }
 
 -- tool name + args table -> reply table (`ok`, `result` | `error`).
