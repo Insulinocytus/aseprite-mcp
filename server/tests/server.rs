@@ -629,3 +629,38 @@ async fn get_image_plugin_error_is_a_tool_error() {
     assert_eq!(seen.recv().await.unwrap(), json!({"layer": "missing"}));
     server.shutdown();
 }
+
+#[tokio::test]
+async fn list_tools_is_exactly_the_four_documented_tools() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let mut names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
+
+    names.sort();
+    assert_eq!(names, ["get_image", "get_status", "query_lua", "run_lua"]);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn invalid_arguments_are_rejected_before_reaching_the_plugin() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let mut seen = connect_image_plugin(&server).await;
+    let client = mcp_client(&server).await;
+    let call = |tool: &'static str, args: Value| {
+        client.call_tool(CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone()))
+    };
+
+    for (tool, args) in [
+        ("run_lua", json!({})),
+        ("query_lua", json!({})),
+        ("run_lua", json!({"code": 5})),
+        ("get_image", json!({"scale": 1.5})),
+        ("get_image", json!({"scale": "2"})),
+    ] {
+        let outcome = call(tool, args.clone()).await;
+        assert!(outcome.is_err() || outcome.unwrap().is_error == Some(true), "{tool} {args} must be rejected");
+    }
+    assert!(seen.try_recv().is_err(), "rejected calls must not reach the Plugin");
+    server.shutdown();
+}

@@ -12,7 +12,8 @@ local rejected_alerted = false
 -- Bridge Token: not a security boundary (that is the loopback bind, ADR 0002), only keeps
 -- another process or a second Aseprite from impersonating this Plugin.
 local function make_token()
-  local addr = tonumber(tostring({}):match("0x(%x+)") or "0", 16) or 0 -- ASLR entropy
+  -- MSVC prints "table: 000001F3A2B4C5D0" (no 0x), glibc "table: 0x55d0...": take the trailing hex.
+  local addr = tonumber(tostring({}):match("(%x+)$") or "0", 16) or 0 -- ASLR entropy
   math.randomseed(os.time() + math.floor(os.clock() * 1e6) + addr)
   local parts = {}
   for i = 1, 4 do parts[i] = string.format("%08x", math.random(0, 0x7fffffff)) end
@@ -46,6 +47,7 @@ local function start(plugin)
   -- `start "" /B` returns at once; the Server is a GUI-subsystem exe so no console window appears.
   os.execute(string.format('start "" /B "%s" --port %d --token %s --log "%s"', exe, port, token, log))
 
+  local rejection = settings.new_rejection(os.time)
   local socket
   socket = WebSocket {
     url = string.format("ws://127.0.0.1:%d/ws?token=%s", port, token),
@@ -57,6 +59,7 @@ local function start(plugin)
       pcall(function()
         if socket ~= ws then return end -- stale socket from before a restart
         if t == WebSocketMessageType.OPEN then
+          rejection.connected()
           set_state("connected")
           send(json.encode { type = "hello", version = tostring(app.version) })
         elseif t == WebSocketMessageType.TEXT then
@@ -64,8 +67,9 @@ local function start(plugin)
         elseif t == WebSocketMessageType.CLOSE then
           set_state("connecting")
         elseif t == WebSocketMessageType.ERROR then
-          if settings.is_unauthorized(reason) then
-            -- Another Aseprite instance owns the Server on this port: stop retrying, tell the user once.
+          if settings.is_unauthorized(reason) and rejection.unauthorized() then
+            -- 401s outlasted the window of an orphan Server's watchdog: another Aseprite instance
+            -- really owns this port. Stop retrying, tell the user once.
             ws:close()
             set_state("rejected")
             if not rejected_alerted then
@@ -73,7 +77,7 @@ local function start(plugin)
               app.alert("MCP 已由另一个 Aseprite 实例提供")
             end
           else
-            set_state("connecting")
+            set_state("connecting") -- includes early 401s: keep reconnecting
           end
         end
       end)
@@ -116,7 +120,7 @@ local function open_settings(plugin)
     onclick = function()
       local p = settings.parse_port(dlg.data.port)
       if not p then
-        app.alert("Port must be a number from 1024 to 65535")
+        app.alert("Port must be a number from 1 to 65535")
         return
       end
       restart(plugin, p)

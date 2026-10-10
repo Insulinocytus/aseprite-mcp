@@ -372,6 +372,108 @@ test("get_image: no undo step; handle_message gives a compact header and the raw
   assert(bytes == nil and json.decode(header).ok == false)
 end)
 
+-- Adds a layer `name` under `parent` (sprite when nil) with one pixel `value` at (x, y) in frame 1.
+local function leaf(s, parent, name, x, y, value)
+  local l = s:newLayer()
+  l.name = name
+  if parent then l.parent = parent end
+  local img = Image(s.width, s.height, s.colorMode)
+  img:putPixel(x, y, value)
+  s:newCel(l, 1, img, Point(0, 0))
+  return l
+end
+
+local function group(s, parent, name)
+  local g = s:newGroup()
+  g.name = name
+  if parent then g.parent = parent end
+  return g
+end
+
+test("get_image: a group layer renders the composite of its visible descendants only", function()
+  local s = Sprite(5, 2, ColorMode.RGB)
+  s.cels[1].image:putPixel(0, 1, app.pixelColor.rgba(9, 9, 9, 255)) -- outside the group
+  local g = group(s, nil, "grp")
+  leaf(s, g, "a", 0, 0, app.pixelColor.rgba(255, 0, 0, 255))
+  leaf(s, g, "b", 1, 0, app.pixelColor.rgba(0, 255, 0, 255))
+  leaf(s, g, "hidden", 2, 0, app.pixelColor.rgba(0, 0, 255, 255)).isVisible = false
+  local inner = group(s, g, "inner")
+  leaf(s, inner, "c", 3, 0, app.pixelColor.rgba(1, 2, 3, 255))
+  local off = group(s, g, "off")
+  leaf(s, off, "d", 4, 0, app.pixelColor.rgba(7, 7, 7, 255))
+  off.isVisible = false
+  local r = get_image { layer = "grp" }
+  assert(r.ok, tostring(r.error))
+  assert(r.width == 5 and r.height == 2 and #r.bytes == 40)
+  assert(px(r, 0, 0) == "255,0,0,255" and px(r, 1, 0) == "0,255,0,255" and px(r, 3, 0) == "1,2,3,255", px(r, 3, 0))
+  assert(px(r, 2, 0) == "0,0,0,0", "hidden layer in group must not render")
+  assert(px(r, 4, 0) == "0,0,0,0", "layers of a hidden subgroup must not render")
+  assert(px(r, 0, 1) == "0,0,0,0", "layers outside the group must not render")
+  assert(px(get_image { layer = "grp/inner" }, 3, 0) == "1,2,3,255", "nested group path")
+  g.isVisible = false
+  assert(px(get_image { layer = "grp" }, 0, 0) == "255,0,0,255", "a hidden group renders when asked for, like a hidden layer")
+end)
+
+test("get_image: a group layer applies the palette for indexed sprites", function()
+  local s = Sprite(2, 1, ColorMode.INDEXED)
+  s.palettes[1]:resize(3)
+  s.palettes[1]:setColor(1, Color { r = 10, g = 20, b = 30, a = 255 })
+  s.palettes[1]:setColor(2, Color { r = 200, g = 100, b = 50, a = 255 })
+  local g = group(s, nil, "grp")
+  leaf(s, g, "a", 0, 0, 1)
+  leaf(s, g, "b", 1, 0, 2)
+  local r = get_image { layer = "grp" }
+  assert(r.ok, tostring(r.error))
+  assert(px(r, 0, 0) == "10,20,30,255" and px(r, 1, 0) == "200,100,50,255", px(r, 0, 0))
+end)
+
+test("one call changing several sprites: other sprites' edits land in their own undo history", function()
+  local a = new_sprite()
+  a.filename = "a.aseprite"
+  local b = Sprite(16, 16)
+  b.filename = "b.aseprite"
+  app.sprite = a
+  app.transaction("baseline a", function() a:newLayer() end) -- a layers: 2
+  app.sprite = b
+  app.transaction("baseline b", function() b:newLayer() end) -- b layers: 2
+  app.sprite = a
+  local r = run("mcp.sprite('a.aseprite'):newLayer(); mcp.sprite('b.aseprite'):newLayer()")
+  assert(r.ok, tostring(r.error))
+  assert(layers(a) == 3 and layers(b) == 3)
+  assert(app.sprite == a, "active sprite is restored")
+  app.undo() -- active sprite a: the call's step
+  assert(layers(a) == 2 and layers(b) == 3, "undo on the active sprite reverts only its own change")
+  app.sprite = b
+  app.undo()
+  assert(layers(b) == 2 and layers(a) == 2, "b's change is in b's own history, got " .. layers(b))
+  app.undo()
+  assert(layers(b) == 1 and layers(a) == 2, "next undo on b must be b's baseline")
+end)
+
+test("app.command inside run_lua is part of the call's undo step", function()
+  local s = new_sprite()
+  app.transaction("baseline", function() s:newLayer() end) -- layers: 2
+  local r = run("app.command.NewFrame()")
+  assert(r.ok, tostring(r.error))
+  assert(#s.frames == 2)
+  app.undo()
+  assert(#s.frames == 1 and layers(s) == 2, "one undo must revert the command and nothing else")
+  r = run("app.sprite:newLayer(); app.command.NewFrame()")
+  assert(r.ok, tostring(r.error))
+  app.undo()
+  assert(#s.frames == 1 and layers(s) == 2, "command + API call in one call revert together")
+end)
+
+test("serialization: cyclic tables become a placeholder, shared tables stay intact", function()
+  local r = query("local t = { name = 'n' }; t.self = t; return t")
+  assert(r.ok, tostring(r.error))
+  assert(r.result.name == "n" and type(r.result.self) == "string", "cycle must become a string")
+  r = query("local a = { 1 }; local b = { a }; a[2] = b; return { b, a }")
+  assert(r.ok and type(r.result[1][1][2]) == "string", "indirect cycle must become a string")
+  r = query("local s = { 7 }; return { s, s }")
+  assert(r.ok and r.result[1][1] == 7 and r.result[2][1] == 7, "shared, acyclic tables are not cycles")
+end)
+
 for _, t in ipairs(tests) do
   local ok, err = pcall(t.fn)
   print((ok and "PASS " or "FAIL ") .. t.name .. (ok and "" or (": " .. tostring(err))))

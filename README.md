@@ -16,11 +16,11 @@
 
 ### 2. 授权
 
-首次启动时 Aseprite 会弹出一个脚本授权窗口，请求运行 Aseprite MCP 的脚本。选择 **完全信任此脚本**（Give this script full trust）。授权是一次性的，之后不再询问。
+首次启动时 Aseprite 会弹出一个授权窗口，请求运行 Aseprite MCP 的 Plugin。选择 **完全信任此脚本**（Give this script full trust）。授权是一次性的，之后不再询问。
 
 ### 3. 配置 MCP Client
 
-打开 Aseprite，菜单 **Help → MCP Server…** 可查看 Server 和 Bridge 状态，并复制现成的客户端配置片段。以 Claude Code 为例：
+打开 Aseprite，菜单 **Help → MCP Server…** 可查看 Server 和 Bridge 状态，并复制现成的 MCP Client 配置片段。以 Claude Code 为例：
 
 ```sh
 claude mcp add --transport http aseprite http://127.0.0.1:48653/mcp
