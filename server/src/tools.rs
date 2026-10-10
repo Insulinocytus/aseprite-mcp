@@ -7,6 +7,7 @@ use rmcp::{
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -64,7 +65,7 @@ struct RunLuaArgs {
 
 impl Tools {
     pub fn new(hub: Arc<Hub>, port: u16) -> Self {
-        Self { hub, port, tool_router: Self::tool_router() + Self::status_router() }
+        Self { hub, port, tool_router: Self::tool_router() + Self::status_router() + Self::image_router() }
     }
 
     /// Runs a call on the Plugin and maps its reply to an MCP result: the result (or error) text,
@@ -129,6 +130,61 @@ impl Tools {
             }
         }
         CallToolResult::success(vec![ContentBlock::text(status.to_string())])
+    }
+}
+
+const GET_IMAGE_DESCRIPTION: &str = "Return a PNG of a sprite so you can see the artwork. By default it shows the active sprite's \
+current frame with all visible layers composited, as the user sees it. Pixel art is enlarged automatically \
+(integer nearest-neighbor, smallest factor that makes the long side at least 256 px), so the returned image is larger than \
+the canvas; divide coordinates by `scale` to get canvas pixels. Creates no undo step.\n\
+\n\
+Arguments (all optional): `sprite` is a file name or full path (default: the active sprite); `frame` is a 1-based frame number \
+(default: the current frame); `layer` is a layer path of names separated by `/` such as \"group/child\" \
+(default: the visible layers composited; with a layer, only that layer's pixels in that frame are drawn, even if it is hidden); \
+`scale` is an integer factor of at least 1 (default: automatic).";
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetImageArgs {
+    /// Sprite file name or full path; default is the active sprite.
+    sprite: Option<String>,
+    /// 1-based frame number; default is the current frame.
+    frame: Option<u32>,
+    /// Layer path such as "group/child"; default is the visible layers composited.
+    layer: Option<String>,
+    /// Integer upscale factor; default makes the long side at least 256 px.
+    scale: Option<u32>,
+}
+
+#[tool_router(router = image_router)]
+impl Tools {
+    #[tool(description = GET_IMAGE_DESCRIPTION)]
+    async fn get_image(&self, Parameters(args): Parameters<GetImageArgs>) -> CallToolResult {
+        let fail = |msg: String| CallToolResult::error(vec![ContentBlock::text(msg)]);
+        let mut plugin_args = serde_json::Map::new();
+        if let Some(sprite) = args.sprite {
+            plugin_args.insert("sprite".into(), json!(sprite));
+        }
+        if let Some(frame) = args.frame {
+            plugin_args.insert("frame".into(), json!(frame));
+        }
+        if let Some(layer) = args.layer {
+            plugin_args.insert("layer".into(), json!(layer));
+        }
+        let reply = match self.hub.call_binary("get_image", Value::Object(plugin_args)).await {
+            Ok(reply) => reply,
+            Err(e) => return fail(e.to_string()),
+        };
+        if reply.msg["ok"] != true {
+            return fail(reply.msg["error"].as_str().unwrap_or("unknown plugin error").to_owned());
+        }
+        let dim = |key: &str| reply.msg[key].as_u64().and_then(|n| u32::try_from(n).ok());
+        let (Some(width), Some(height)) = (dim("width"), dim("height")) else {
+            return fail("bad image reply from plugin: missing width/height".to_owned());
+        };
+        match crate::image::render_png(&reply.bytes, width, height, args.scale) {
+            Ok(png) => CallToolResult::success(vec![ContentBlock::image(STANDARD.encode(png), "image/png")]),
+            Err(e) => fail(e),
+        }
     }
 }
 
