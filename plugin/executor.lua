@@ -1,10 +1,5 @@
 -- Tool-call executor. Pure Aseprite Lua, no WebSocket: plugin.lua feeds it Bridge messages,
 -- plugin/tests/ call it directly. Returns a module table.
---
--- Extension points for later tickets:
---   * add a tool: add a function to `handlers` (args -> reply table)
---   * query_lua: call `run_chunk(code, "query_lua", false)`
---   * print capture, view restore, `mcp` helper env: all belong inside `run_chunk`
 local M = {}
 
 local MAX_DEPTH = 32
@@ -15,7 +10,9 @@ local function new_env() return setmetatable({ mcp = mcp }, { __index = _G }) en
 
 -- Normalises a Lua value so json.encode accepts it: tables become arrays when they are
 -- sequences and objects otherwise, anything else json cannot hold becomes tostring(v).
-local function to_json(v, depth)
+-- `path` holds the tables being converted right now: meeting one again is a cycle, which
+-- becomes a placeholder string (a table shared by two siblings is not a cycle).
+local function to_json(v, depth, path)
   local t = type(v)
   if t == "nil" or t == "boolean" or t == "string" then return v end
   if t == "number" then
@@ -23,14 +20,18 @@ local function to_json(v, depth)
     return v
   end
   if t ~= "table" or depth >= MAX_DEPTH then return tostring(v) end
+  path = path or {}
+  if path[v] then return "<cycle>" end
+  path[v] = true
   local n, count = #v, 0
   for _ in pairs(v) do count = count + 1 end
   local out = {}
   if n == count then
-    for i = 1, n do out[i] = to_json(v[i], depth + 1) end
+    for i = 1, n do out[i] = to_json(v[i], depth + 1, path) end
   else
-    for k, x in pairs(v) do out[tostring(k)] = to_json(x, depth + 1) end
+    for k, x in pairs(v) do out[tostring(k)] = to_json(x, depth + 1, path) end
   end
+  path[v] = nil
   return out
 end
 
@@ -88,7 +89,7 @@ local function run_chunk(code, name, transactional)
   return { ok = false, error = tostring(failure or e), output = output }
 end
 
-local COLOR_MODES = { [ColorMode.RGB] = "rgb", [ColorMode.GRAYSCALE] = "grayscale", [ColorMode.INDEXED] = "indexed" }
+local COLOR_MODES = { [ColorMode.RGB] = "rgb", [ColorMode.GRAY] = "grayscale", [ColorMode.INDEXED] = "indexed" }
 
 -- Read-only: no transaction, so no undo step.
 local function status()
@@ -106,17 +107,18 @@ local function status()
   return { ok = true, result = { aseprite_version = tostring(app.version), sprites = sprites } }
 end
 
--- Renders `frame` of `sprite` as an RGB-mode (RGBA8 bytes) Image: the visible-layer composite, or
--- only `layer`'s cel. drawImage ignores the palette of indexed cels, so those are converted by hand.
--- shortcut: single-layer render ignores layer/cel opacity and blend mode, upgrade if asked.
-local function render(sprite, frame, layer)
-  local img = Image(sprite.width, sprite.height, ColorMode.RGB)
-  if not layer then
-    img:drawSprite(sprite, frame)
-    return img
+-- Draws `layer`'s cel at `frame` onto the RGB-mode `img`; a group draws its visible descendants
+-- bottom to top. drawImage ignores the palette of indexed cels, so those are converted by hand.
+-- shortcut: ignores layer/cel opacity and blend mode, upgrade if asked.
+local function draw_layer(img, sprite, frame, layer)
+  if layer.isGroup then
+    for _, child in ipairs(layer.layers) do
+      if child.isVisible then draw_layer(img, sprite, frame, child) end
+    end
+    return
   end
   local cel = mcp.cel(layer, frame)
-  if not cel then return img end
+  if not cel then return end
   local src = cel.image
   if sprite.colorMode == ColorMode.INDEXED then
     local palette, transparent = sprite.palettes[1], sprite.transparentColor
@@ -131,6 +133,13 @@ local function render(sprite, frame, layer)
     src = rgb
   end
   img:drawImage(src, cel.position)
+end
+
+-- Renders `frame` of `sprite` as an RGB-mode (RGBA8 bytes) Image: the visible-layer composite, or
+-- only `layer` (its own visibility is ignored; a group's visible descendants are composited).
+local function render(sprite, frame, layer)
+  local img = Image(sprite.width, sprite.height, ColorMode.RGB)
+  if layer then draw_layer(img, sprite, frame, layer) else img:drawSprite(sprite, frame) end
   return img
 end
 

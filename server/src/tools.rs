@@ -140,7 +140,8 @@ the canvas; divide coordinates by `scale` to get canvas pixels. Creates no undo 
 \n\
 Arguments (all optional): `sprite` is a file name or full path (default: the active sprite); `frame` is a 1-based frame number \
 (default: the current frame); `layer` is a layer path of names separated by `/` such as \"group/child\" \
-(default: the visible layers composited; with a layer, only that layer's pixels in that frame are drawn, even if it is hidden); \
+(default: the visible layers composited; with a layer, only that layer's pixels in that frame are drawn, even if it is hidden; \
+with a group, the visible layers inside the group are composited); \
 `scale` is an integer factor of at least 1 (default: automatic).";
 
 #[derive(Deserialize, schemars::JsonSchema)]
