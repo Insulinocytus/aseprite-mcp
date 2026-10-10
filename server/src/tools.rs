@@ -11,11 +11,44 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-const RUN_LUA_DESCRIPTION: &str = "Run Lua in the live Aseprite GUI and modify the document. \
-The code is the body of a function: use `return` to give a value back (the first returned value is \
-sent as JSON). Errors return the message and a Lua traceback. With an active sprite the whole call \
-is one undo step named \"MCP: run_lua\" (one Ctrl+Z reverts it) and is rolled back if the code errors. \
-Never open UI (Dialog:show, commands with ui=true): a dialog blocks every later call.";
+const RUN_LUA_DESCRIPTION: &str = "Run Lua in the live Aseprite GUI to modify the document. \
+Use this for any change: the whole call is one undo step (\"MCP: run_lua\", one Ctrl+Z reverts it) and is rolled back \
+if the code errors. For pure reads use query_lua instead (no empty undo step).\n\
+\n\
+Calling convention: `code` is the body of a Lua function, not a script file. `return` a value to get it back as JSON \
+(first returned value only; tables become arrays or objects, userdata becomes a string, nil becomes null). \
+`print(...)` output is captured and returned too. Errors return the message plus a Lua traceback. \
+With no open sprite the code still runs, just without an undo step.\n\
+\n\
+Helpers in the global `mcp` table (they raise an error when nothing matches):\n\
+- mcp.sprite(name?) -> Sprite: by file name or full path; omit for the active sprite.\n\
+- mcp.layer(sprite, \"group/child\") -> Layer: path of layer names, nested groups separated by `/`.\n\
+- mcp.cel(layer, frame, create?) -> Cel: frame is a number; returns nil if the cel is missing, or makes an empty one when create=true.\n\
+- mcp.edit_image(cel, fn): fn(image) edits a clone of cel.image, which is then assigned back. \
+Always use this to change pixels: assigning into cel.image directly is not undoable. If fn errors the cel is left unchanged.\n\
+\n\
+Never open UI (Dialog:show, app.command.* with ui=true): a dialog blocks this and every later call until timeout. \
+Before app.command.* make sure the intended layer/frame is active. Aseprite's own view (active sprite, layer, frame) is restored after the call.\n\
+\n\
+If one call changes several sprites, the active sprite's changes are in the call's undo step; changes to other sprites go into each sprite's own undo history.";
+
+#[allow(dead_code)] // wired to the `query_lua` tool once that tool is registered
+const QUERY_LUA_DESCRIPTION: &str = "Run read-only Lua in the live Aseprite GUI to inspect the document. \
+Use this for pure reads (layers, frames, cels, tags, pixels, properties): it never creates an undo step. \
+Do not modify anything with it: the changes cannot be undone by the user. To modify, use run_lua.\n\
+\n\
+Calling convention: `code` is the body of a Lua function, not a script file. `return` a value to get it back as JSON \
+(first returned value only; tables become arrays or objects, userdata becomes a string, nil becomes null). \
+`print(...)` output is captured and returned too. Errors return the message plus a Lua traceback.\n\
+\n\
+Helpers in the global `mcp` table (they raise an error when nothing matches):\n\
+- mcp.sprite(name?) -> Sprite: by file name or full path; omit for the active sprite.\n\
+- mcp.layer(sprite, \"group/child\") -> Layer: path of layer names, nested groups separated by `/`.\n\
+- mcp.cel(layer, frame, create?) -> Cel: frame is a number; returns nil if the cel is missing (do not pass create here).\n\
+- mcp.edit_image(cel, fn): modifies pixels; run_lua only.\n\
+\n\
+Never open UI (Dialog:show, app.command.* with ui=true): a dialog blocks this and every later call until timeout. \
+Aseprite's own view (active sprite, layer, frame) is restored after the call.";
 
 #[derive(Clone)]
 pub struct Tools {

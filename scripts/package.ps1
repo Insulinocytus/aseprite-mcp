@@ -10,7 +10,7 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 $stage = Join-Path ([IO.Path]::GetTempPath()) "aseprite-mcp-$([guid]::NewGuid())"
 New-Item -ItemType Directory $stage | Out-Null
 try {
-  Copy-Item "$root\plugin\package.json", "$root\plugin\plugin.lua", "$root\plugin\executor.lua" $stage
+  Copy-Item "$root\plugin\package.json", "$root\plugin\plugin.lua", "$root\plugin\executor.lua", "$root\plugin\mcp.lua" $stage
   Copy-Item "$root\server\target\release\aseprite-mcp-server.exe" $stage
   New-Item -ItemType Directory "$root\dist" -Force | Out-Null
   $out = "$root\dist\aseprite-mcp-$version.aseprite-extension"

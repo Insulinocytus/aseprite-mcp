@@ -9,6 +9,10 @@ local M = {}
 
 local MAX_DEPTH = 32
 
+-- Raw Lua env: globals plus `mcp`. Sibling file, found relative to this one (dofile'd by plugin.lua and tests).
+local mcp = dofile(debug.getinfo(1, "S").source:sub(2):gsub("[^/\\]*$", "") .. "mcp.lua")
+local function new_env() return setmetatable({ mcp = mcp }, { __index = _G }) end
+
 -- Normalises a Lua value so json.encode accepts it: tables become arrays when they are
 -- sequences and objects otherwise, anything else json cannot hold becomes tostring(v).
 local function to_json(v, depth)
@@ -33,7 +37,7 @@ end
 -- Runs Lua source as a function body. With `transactional` and an active sprite the whole call
 -- is one undo step; without a sprite app.transaction would throw an opaque C++ exception, so skip it.
 local function run_chunk(code, name, transactional)
-  local fn, load_err = load(code, "=" .. name, "t")
+  local fn, load_err = load(code, "=" .. name, "t", new_env())
   if not fn then return { ok = false, error = load_err } end
 
   local result, failure
