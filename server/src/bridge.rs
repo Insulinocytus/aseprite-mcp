@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -38,6 +38,10 @@ pub struct Hub {
     bridge: Mutex<Option<(u64, mpsc::UnboundedSender<String>)>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
     next_id: AtomicU64,
+    /// Held for a whole call so only one call is in flight toward the Plugin; the rest queue here.
+    gate: AsyncMutex<()>,
+    /// Whether a Bridge is registered; the lifecycle watchdog follows it.
+    connected: watch::Sender<bool>,
 }
 
 impl Hub {
@@ -49,6 +53,8 @@ impl Hub {
             bridge: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            gate: AsyncMutex::new(()),
+            connected: watch::channel(false).0,
         }
     }
 
@@ -60,8 +66,17 @@ impl Hub {
         self.log.line(msg);
     }
 
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.connected.subscribe()
+    }
+
     /// Sends a tool call to the Plugin and returns its reply message (`{"id","ok",...}`).
     pub async fn call(&self, tool: &str, args: Value) -> Result<Value, CallError> {
+        // Fail at once when nothing is connected instead of queueing behind a running call.
+        if self.bridge.lock().is_none() {
+            return Err(CallError::NotConnected);
+        }
+        let _turn = self.gate.lock().await;
         let tx = self.bridge.lock().as_ref().map(|(_, tx)| tx.clone()).ok_or(CallError::NotConnected)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -86,10 +101,12 @@ impl Hub {
         let conn = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Replacing the sender drops the old one, which ends the old connection's loop.
         *self.bridge.lock() = Some((conn, tx));
+        self.connected.send_replace(true);
         self.log("bridge connected");
 
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled() => break,
                 out = rx.recv() => match out {
                     Some(text) => if socket.send(Message::Text(text.into())).await.is_err() { break },
                     None => break,
@@ -105,6 +122,7 @@ impl Hub {
         let mut bridge = self.bridge.lock();
         if matches!(&*bridge, Some((c, _)) if *c == conn) {
             *bridge = None;
+            self.connected.send_replace(false);
         }
         self.log("bridge disconnected");
     }
