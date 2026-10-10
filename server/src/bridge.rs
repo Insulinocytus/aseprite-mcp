@@ -30,13 +30,19 @@ impl fmt::Display for CallError {
     }
 }
 
+/// A Plugin reply: the JSON message plus the payload of a binary frame (empty for text frames).
+pub struct Reply {
+    pub msg: Value,
+    pub bytes: Vec<u8>,
+}
+
 pub struct Hub {
     call_timeout: Duration,
     log: Log,
     shutdown: CancellationToken,
     /// (connection id, outgoing text frames) of the current Bridge.
     bridge: Mutex<Option<(u64, mpsc::UnboundedSender<String>)>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     /// Held for a whole call so only one call is in flight toward the Plugin; the rest queue here.
     gate: AsyncMutex<()>,
@@ -72,6 +78,11 @@ impl Hub {
 
     /// Sends a tool call to the Plugin and returns its reply message (`{"id","ok",...}`).
     pub async fn call(&self, tool: &str, args: Value) -> Result<Value, CallError> {
+        self.call_binary(tool, args).await.map(|r| r.msg)
+    }
+
+    /// Like `call`, plus the raw bytes of a binary reply (empty for text replies).
+    pub async fn call_binary(&self, tool: &str, args: Value) -> Result<Reply, CallError> {
         // Fail at once when nothing is connected instead of queueing behind a running call.
         if self.bridge.lock().is_none() {
             return Err(CallError::NotConnected);
@@ -113,6 +124,7 @@ impl Hub {
                 },
                 msg = socket.recv() => match msg {
                     Some(Ok(Message::Text(text))) => self.on_text(&text),
+                    Some(Ok(Message::Binary(frame))) => self.on_binary(&frame),
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => {}
                 },
@@ -138,15 +150,30 @@ impl Hub {
                 self.log("bye from plugin, shutting down");
                 self.shutdown.cancel();
             }
-            _ => {
-                let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
-                match self.pending.lock().remove(&id) {
-                    Some(waiter) => {
-                        let _ = waiter.send(msg);
-                    }
-                    None => self.log(format!("dropping reply for unknown or timed-out call {id}")),
-                }
+            _ => self.deliver(msg, Vec::new()),
+        }
+    }
+
+    /// Binary frame: `<compact JSON header>\n<raw bytes>`, split at the first `\n`
+    /// (the header never contains a raw newline, the bytes may).
+    fn on_binary(&self, frame: &[u8]) {
+        let parsed = frame
+            .iter()
+            .position(|&b| b == b'\n')
+            .and_then(|i| Some((serde_json::from_slice::<Value>(&frame[..i]).ok()?, &frame[i + 1..])));
+        match parsed {
+            Some((header, bytes)) => self.deliver(header, bytes.to_vec()),
+            None => self.log("bad binary frame from plugin"),
+        }
+    }
+
+    fn deliver(&self, msg: Value, bytes: Vec<u8>) {
+        let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
+        match self.pending.lock().remove(&id) {
+            Some(waiter) => {
+                let _ = waiter.send(Reply { msg, bytes });
             }
+            None => self.log(format!("dropping reply for unknown or timed-out call {id}")),
         }
     }
 }

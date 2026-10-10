@@ -493,3 +493,139 @@ async fn non_loopback_origin_or_host_is_refused() {
     assert_eq!(http_status(&server, "/ws?token=test-token", &local, Some("http://evil.example")).await, 403);
     server.shutdown();
 }
+
+// ---- get_image ----
+
+use aseprite_mcp_server::image::{default_scale, render_png, upscale};
+use base64::{Engine, engine::general_purpose::STANDARD};
+
+fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!((info.color_type, info.bit_depth), (png::ColorType::Rgba, png::BitDepth::Eight));
+    buf.truncate(info.buffer_size());
+    (info.width, info.height, buf)
+}
+
+/// 3x2 RGBA with distinct pixels; the second pixel's red byte is 0x0a (a newline).
+const PIXELS: [u8; 24] = [
+    255, 0, 0, 255, 10, 20, 30, 40, 0, 0, 255, 0, //
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+];
+
+#[test]
+fn default_scale_is_smallest_integer_reaching_256() {
+    assert_eq!(default_scale(16, 16), 16);
+    assert_eq!(default_scale(100, 50), 3);
+    assert_eq!(default_scale(50, 100), 3);
+    assert_eq!(default_scale(256, 10), 1);
+    assert_eq!(default_scale(1000, 1000), 1);
+}
+
+#[test]
+fn upscale_repeats_each_pixel() {
+    let out = upscale(&[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4], 2, 2, 2);
+    let px = |v: u8| [v, v, v, v];
+    let row = |a: u8, b: u8| [px(a), px(a), px(b), px(b)].concat();
+    assert_eq!(out, [row(1, 2), row(1, 2), row(3, 4), row(3, 4)].concat());
+}
+
+#[test]
+fn png_decodes_back_to_original_pixels() {
+    let (w, h, pixels) = decode_png(&render_png(&PIXELS, 3, 2, Some(1)).unwrap());
+    assert_eq!((w, h), (3, 2));
+    assert_eq!(pixels, PIXELS);
+
+    let (w, h, pixels) = decode_png(&render_png(&PIXELS, 3, 2, Some(4)).unwrap());
+    assert_eq!((w, h), (12, 8));
+    assert_eq!(pixels, upscale(&PIXELS, 3, 2, 4));
+    // spot-check one pixel of the 4x block of source pixel (1, 1) = [5,6,7,8]
+    let at = |x: usize, y: usize| pixels[(y * 12 + x) * 4..][..4].to_vec();
+    assert_eq!(at(4, 4), [5, 6, 7, 8]);
+    assert_eq!(at(7, 7), [5, 6, 7, 8]);
+    assert_eq!(at(8, 4), [9, 10, 11, 12]);
+}
+
+#[test]
+fn render_png_rejects_bad_input() {
+    assert!(render_png(&PIXELS[..20], 3, 2, None).is_err());
+    assert!(render_png(&PIXELS, 3, 2, Some(0)).is_err());
+    assert!(render_png(&PIXELS, 3, 2, Some(100_000)).is_err());
+}
+
+/// Fake Plugin for get_image: records the args it got and replies with a binary frame
+/// (`PIXELS`, 3x2), or with a text error when `layer` is "missing".
+async fn connect_image_plugin(server: &Server) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+    let (mut ws, _) = connect_async(format!("ws://{}/ws?token={TOKEN}", server.addr)).await.unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let req: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(req["tool"], "get_image");
+            seen_tx.send(req["args"].clone()).unwrap();
+            if req["args"]["layer"] == "missing" {
+                let reply = json!({"id": req["id"], "ok": false, "error": "layer not found: missing"});
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+                continue;
+            }
+            let mut frame = json!({"id": req["id"], "ok": true, "width": 3, "height": 2}).to_string().into_bytes();
+            frame.push(b'\n');
+            frame.extend_from_slice(&PIXELS);
+            ws.send(Message::Binary(frame.into())).await.unwrap();
+        }
+    });
+    seen_rx
+}
+
+async fn get_image(client: &RunningService<RoleClient, ClientConfig>, args: Value) -> CallToolResult {
+    let args = args.as_object().unwrap().clone();
+    for _ in 0..50 {
+        let result = client.call_tool(CallToolRequestParams::new("get_image").with_arguments(args.clone())).await.unwrap();
+        if result.is_error != Some(true) || !text(&result).contains("not connected") {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Bridge never connected");
+}
+
+#[tokio::test]
+async fn get_image_returns_upscaled_png_from_binary_frame() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let mut seen = connect_image_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = get_image(&client, json!({"sprite": "a.aseprite", "frame": 2, "scale": 2})).await;
+
+    assert_eq!(result.is_error, Some(false));
+    let image = result.content[0].as_image().unwrap();
+    assert_eq!(image.mime_type, "image/png");
+    let (w, h, pixels) = decode_png(&STANDARD.decode(&image.data).unwrap());
+    assert_eq!((w, h), (6, 4));
+    assert_eq!(pixels, upscale(&PIXELS, 3, 2, 2));
+    assert_eq!(seen.recv().await.unwrap(), json!({"sprite": "a.aseprite", "frame": 2}));
+
+    // default scale: 3x2 -> ceil(256/3) = 86
+    let result = get_image(&client, json!({})).await;
+    let (w, h, pixels) = decode_png(&STANDARD.decode(&result.content[0].as_image().unwrap().data).unwrap());
+    assert_eq!((w, h), (3 * 86, 2 * 86));
+    assert_eq!(&pixels[..4], [255, 0, 0, 255]);
+    assert_eq!(seen.recv().await.unwrap(), json!({}));
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn get_image_plugin_error_is_a_tool_error() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let mut seen = connect_image_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = get_image(&client, json!({"layer": "missing"})).await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result), "layer not found: missing");
+    assert_eq!(seen.recv().await.unwrap(), json!({"layer": "missing"}));
+    server.shutdown();
+}

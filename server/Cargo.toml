@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
 parking_lot = "0.12.5"
+png = "0.18.1"
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }

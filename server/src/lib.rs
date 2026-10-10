@@ -1,4 +1,5 @@
 mod bridge;
+pub mod image;
 mod log;
 mod tools;
 
