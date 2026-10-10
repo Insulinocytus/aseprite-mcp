@@ -100,6 +100,78 @@ test("handle_message round-trips an id and reports bad input", function()
   s:close()
 end)
 
+local function query(code) return executor.execute("query_lua", { code = code }) end
+
+test("query_lua adds no undo step, even when it errors", function()
+  local s = new_sprite()
+  app.transaction("baseline", function() s:newLayer() end) -- layers: 2
+  local r = query("return #app.sprite.layers")
+  assert(r.ok and r.result == 2, tostring(r.error))
+  r = query("error('read boom')")
+  assert(not r.ok and r.error:find("read boom", 1, true), tostring(r.error))
+  app.undo()
+  assert(layers(s) == 1, "the first undo must revert the baseline, so query_lua left no step")
+  s:close()
+end)
+
+test("print is captured line by line and restored", function()
+  local original = print
+  local r = run("print('a'); print('b', 1); print(); return 1")
+  assert(r.ok and r.result == 1, tostring(r.error))
+  assert(#r.output == 3 and r.output[1] == "a" and r.output[2] == "b\t1" and r.output[3] == "", #r.output)
+  assert(print == original, "print must be restored")
+  r = query("print('q'); return 2")
+  assert(r.ok and #r.output == 1 and r.output[1] == "q")
+  assert(print == original)
+  r = query("return 3")
+  assert(r.ok and #r.output == 0)
+end)
+
+test("print is restored and output kept when the code errors", function()
+  local original = print
+  local s = new_sprite()
+  local r = run("print('before'); error('late')")
+  assert(not r.ok and r.output[1] == "before", tostring(r.error))
+  assert(print == original)
+  r = query("print('x'); return (")
+  assert(not r.ok and print == original)
+  s:close()
+end)
+
+test("view is restored after the call", function()
+  local s1 = new_sprite()
+  local s2 = Sprite(8, 8)
+  s2:newLayer()
+  s2:newFrame()
+  local l1, f1 = s2.layers[1], s2.frames[1]
+  app.sprite, app.layer, app.frame = s2, l1, f1
+  local r = run("app.sprite = Sprite(4, 4); return #app.sprite.layers")
+  assert(r.ok, tostring(r.error))
+  assert(app.sprite == s2 and app.layer == l1 and app.frame == f1, "view must be restored")
+  r = query("app.sprite = nil; return 1") -- also on query_lua
+  assert(app.sprite == s2 and app.layer == l1 and app.frame == f1)
+  -- a recorded sprite that the code closed is not restored (and must not error)
+  r = run("app.sprite:close(); return 1")
+  assert(r.ok, tostring(r.error))
+  assert(app.sprite ~= s2)
+  s1:close()
+end)
+
+test("serialization: nested, mixed and empty tables, userdata, nil", function()
+  local r = query("return { { 1, 2 }, { x = 'y' } }")
+  assert(r.ok and r.result[1][2] == 2 and r.result[2].x == "y")
+  r = query("return { 1, 2, k = 3 }")
+  assert(r.ok and r.result.k == 3 and r.result["1"] == 1, "non-sequence tables become objects")
+  r = query("return {}")
+  assert(r.ok and type(r.result) ~= "string")
+  r = query("return Rectangle(1, 2, 3, 4)")
+  assert(r.ok and type(r.result) == "string")
+  r = query("return 1, 2")
+  assert(r.ok and r.result == 1, "first return value only")
+  local out = json.decode(executor.handle_message(json.encode { id = 1, tool = "query_lua", args = { code = "return nil" } }))
+  assert(out.ok == true and out.result == nil and out.id == 1)
+end)
+
 for _, t in ipairs(tests) do
   local ok, err = pcall(t.fn)
   print((ok and "PASS " or "FAIL ") .. t.name .. (ok and "" or (": " .. tostring(err))))

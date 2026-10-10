@@ -30,13 +30,30 @@ local function to_json(v, depth)
   return out
 end
 
+-- Puts back the sprite/layer/frame the user had, for those still alive. Best effort: a stale
+-- object must never turn a finished call into an error.
+local function restore_view(sprite, layer, frame)
+  if not sprite then return end
+  local alive = false
+  for _, s in ipairs(app.sprites) do alive = alive or s == sprite end
+  if not alive then return end
+  pcall(function() app.sprite = sprite end)
+  if layer and pcall(function() assert(layer.sprite == sprite) end) then pcall(function() app.layer = layer end) end
+  if frame and pcall(function() assert(frame.sprite == sprite and frame.frameNumber <= #sprite.frames) end) then
+    pcall(function() app.frame = frame end)
+  end
+end
+
 -- Runs Lua source as a function body. With `transactional` and an active sprite the whole call
 -- is one undo step; without a sprite app.transaction would throw an opaque C++ exception, so skip it.
+-- `print` is swapped for a collector while the code runs and always restored; the user's
+-- active sprite/layer/frame are restored afterwards.
 local function run_chunk(code, name, transactional)
   local fn, load_err = load(code, "=" .. name, "t")
-  if not fn then return { ok = false, error = load_err } end
+  if not fn then return { ok = false, error = load_err, output = {} } end
 
   local result, failure
+  local output = {}
   local function body()
     -- Capture the traceback where the error happens; it is lost once the error crosses the transaction.
     local ok, r = xpcall(fn, debug.traceback)
@@ -47,18 +64,29 @@ local function run_chunk(code, name, transactional)
     result = r
   end
 
+  local sprite, layer, frame = app.sprite, app.layer, app.frame
+  local original_print = print
+  print = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    output[#output + 1] = table.concat(parts, "\t")
+  end
   local ok, e
   if transactional and app.sprite then
     ok, e = pcall(app.transaction, "MCP: " .. name, body)
   else
     ok, e = pcall(body)
   end
-  if ok then return { ok = true, result = to_json(result, 0) } end
-  return { ok = false, error = tostring(failure or e) }
+  print = original_print
+  restore_view(sprite, layer, frame)
+
+  if ok then return { ok = true, result = to_json(result, 0), output = output } end
+  return { ok = false, error = tostring(failure or e), output = output }
 end
 
 local handlers = {
   run_lua = function(args) return run_chunk(args.code, "run_lua", true) end,
+  query_lua = function(args) return run_chunk(args.code, "query_lua", false) end,
 }
 
 -- tool name + args table -> reply table (`ok`, `result` | `error`).
