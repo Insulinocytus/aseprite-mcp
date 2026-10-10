@@ -58,6 +58,10 @@ impl Hub {
         }
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.bridge.lock().is_some()
+    }
+
     pub fn log(&self, msg: impl AsRef<str>) {
         self.log.line(msg);
     }

@@ -79,7 +79,8 @@ impl Server {
         let mcp = StreamableHttpService::new(
             {
                 let hub = hub.clone();
-                move || Ok(tools::Tools::new(hub.clone()))
+                let port = addr.port();
+                move || Ok(tools::Tools::new(hub.clone(), port))
             },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_cancellation_token(shutdown.child_token()),

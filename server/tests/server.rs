@@ -18,17 +18,24 @@ const TOKEN: &str = "test-token";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Fake Plugin: answers `run_lua` with `{ok:true,result:<label><code>}` unless the code is "fail".
+/// Fake Plugin: answers `run_lua` with `{ok:true,result:<code>}` unless the code is "fail".
 async fn connect_fake_plugin(server: &Server, token: &str) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     fake_plugin(server, token, "").await
 }
 
+/// Like `connect_fake_plugin`, but run_lua results are prefixed with `label` so tests can tell Plugins apart.
 async fn fake_plugin(server: &Server, token: &str, label: &'static str) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     let (mut ws, _) = connect_async(format!("ws://{}/ws?token={token}", server.addr)).await?;
     tokio::spawn(async move {
         ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
         while let Some(Ok(Message::Text(text))) = ws.next().await {
             let req: Value = serde_json::from_str(&text).unwrap();
+            if req["tool"] == "status" {
+                let sprites = json!([{"filename": "a.aseprite", "width": 16, "height": 8, "color_mode": "rgb", "active": true, "modified": false}]);
+                let reply = json!({"id": req["id"], "ok": true, "result": {"aseprite_version": "1.3.test", "sprites": sprites}});
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+                continue;
+            }
             assert_eq!(req["tool"], "run_lua");
             let code = req["args"]["code"].as_str().unwrap();
             let reply = if code == "fail" {
@@ -104,6 +111,112 @@ async fn bridge_rejects_wrong_token_with_401() {
         tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 401),
         other => panic!("expected HTTP 401, got {other:?}"),
     }
+    server.shutdown();
+}
+
+/// Fake Plugin for the Raw Lua Tools: replies `{tool, code}` as the result plus two print lines.
+/// Code "fail" makes it an error reply (still with output).
+async fn connect_echo_plugin(server: &Server) {
+    let (mut ws, _) = connect_async(format!("ws://{}/ws?token={TOKEN}", server.addr)).await.unwrap();
+    tokio::spawn(async move {
+        ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let req: Value = serde_json::from_str(&text).unwrap();
+            let output = json!(["line 1", "line 2"]);
+            let reply = if req["args"]["code"] == "fail" {
+                json!({"id": req["id"], "ok": false, "error": "boom", "output": output})
+            } else {
+                json!({"id": req["id"], "ok": true, "result": {"tool": req["tool"], "code": req["args"]["code"]}, "output": output})
+            };
+            ws.send(Message::text(reply.to_string())).await.unwrap();
+        }
+    });
+}
+
+async fn call_raw(client: &RunningService<RoleClient, ClientConfig>, tool: &'static str, code: &str) -> CallToolResult {
+    let args = json!({ "code": code }).as_object().unwrap().clone();
+    for _ in 0..50 {
+        let result = client.call_tool(CallToolRequestParams::new(tool).with_arguments(args.clone())).await.unwrap();
+        if !text(&result).contains("not connected") {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Bridge never connected");
+}
+
+#[tokio::test]
+async fn query_lua_round_trips_result_and_print_output() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_echo_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = call_raw(&client, "query_lua", "return 1").await;
+
+    assert_eq!(result.is_error, Some(false));
+    let value: Value = serde_json::from_str(text(&result)).unwrap();
+    assert_eq!(value, json!({"tool": "query_lua", "code": "return 1"}));
+    assert_eq!(result.content[1].as_text().unwrap().text, "line 1\nline 2");
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn print_output_is_returned_with_errors_and_run_lua_too() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_echo_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = call_raw(&client, "run_lua", "fail").await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result), "boom");
+    assert_eq!(result.content[1].as_text().unwrap().text, "line 1\nline 2");
+    server.shutdown();
+}
+
+async fn get_status(client: &RunningService<RoleClient, ClientConfig>) -> Value {
+    let result = client.call_tool(CallToolRequestParams::new("get_status")).await.unwrap();
+    assert_eq!(result.is_error, Some(false));
+    serde_json::from_str(text(&result)).unwrap()
+}
+
+#[tokio::test]
+async fn get_status_without_bridge_explains_why() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let status = get_status(&client).await;
+
+    assert_eq!(status["bridge_connected"], false);
+    assert_eq!(status["port"], server.addr.port());
+    assert_eq!(status["server_version"], env!("CARGO_PKG_VERSION"));
+    assert!(status["reason"].as_str().unwrap().contains("not connected"));
+    assert!(status.get("sprites").is_none());
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn get_status_with_bridge_lists_aseprite_version_and_sprites() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_fake_plugin(&server, TOKEN).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let mut status = get_status(&client).await;
+    for _ in 0..50 {
+        if status["bridge_connected"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = get_status(&client).await;
+    }
+
+    assert_eq!(status["bridge_connected"], true);
+    assert!(status.get("reason").is_none());
+    assert_eq!(status["aseprite_version"], "1.3.test");
+    assert_eq!(
+        status["sprites"],
+        json!([{"filename": "a.aseprite", "width": 16, "height": 8, "color_mode": "rgb", "active": true, "modified": false}])
+    );
     server.shutdown();
 }
 
