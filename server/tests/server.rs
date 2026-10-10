@@ -106,6 +106,66 @@ async fn bridge_rejects_wrong_token_with_401() {
     server.shutdown();
 }
 
+/// Fake Plugin for the Raw Lua Tools: replies `{tool, code}` as the result plus two print lines.
+/// Code "fail" makes it an error reply (still with output).
+async fn connect_echo_plugin(server: &Server) {
+    let (mut ws, _) = connect_async(format!("ws://{}/ws?token={TOKEN}", server.addr)).await.unwrap();
+    tokio::spawn(async move {
+        ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let req: Value = serde_json::from_str(&text).unwrap();
+            let output = json!(["line 1", "line 2"]);
+            let reply = if req["args"]["code"] == "fail" {
+                json!({"id": req["id"], "ok": false, "error": "boom", "output": output})
+            } else {
+                json!({"id": req["id"], "ok": true, "result": {"tool": req["tool"], "code": req["args"]["code"]}, "output": output})
+            };
+            ws.send(Message::text(reply.to_string())).await.unwrap();
+        }
+    });
+}
+
+async fn call_raw(client: &RunningService<RoleClient, ClientConfig>, tool: &'static str, code: &str) -> CallToolResult {
+    let args = json!({ "code": code }).as_object().unwrap().clone();
+    for _ in 0..50 {
+        let result = client.call_tool(CallToolRequestParams::new(tool).with_arguments(args.clone())).await.unwrap();
+        if !text(&result).contains("not connected") {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Bridge never connected");
+}
+
+#[tokio::test]
+async fn query_lua_round_trips_result_and_print_output() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_echo_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = call_raw(&client, "query_lua", "return 1").await;
+
+    assert_eq!(result.is_error, Some(false));
+    let value: Value = serde_json::from_str(text(&result)).unwrap();
+    assert_eq!(value, json!({"tool": "query_lua", "code": "return 1"}));
+    assert_eq!(result.content[1].as_text().unwrap().text, "line 1\nline 2");
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn print_output_is_returned_with_errors_and_run_lua_too() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_echo_plugin(&server).await;
+    let client = mcp_client(&server).await;
+
+    let result = call_raw(&client, "run_lua", "fail").await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result), "boom");
+    assert_eq!(result.content[1].as_text().unwrap().text, "line 1\nline 2");
+    server.shutdown();
+}
+
 async fn get_status(client: &RunningService<RoleClient, ClientConfig>) -> Value {
     let result = client.call_tool(CallToolRequestParams::new("get_status")).await.unwrap();
     assert_eq!(result.is_error, Some(false));

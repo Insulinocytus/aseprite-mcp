@@ -32,7 +32,6 @@ Before app.command.* make sure the intended layer/frame is active. Aseprite's ow
 \n\
 If one call changes several sprites, the active sprite's changes are in the call's undo step; changes to other sprites go into each sprite's own undo history.";
 
-#[allow(dead_code)] // wired to the `query_lua` tool once that tool is registered
 const QUERY_LUA_DESCRIPTION: &str = "Run read-only Lua in the live Aseprite GUI to inspect the document. \
 Use this for pure reads (layers, frames, cels, tags, pixels, properties): it never creates an undo step. \
 Do not modify anything with it: the changes cannot be undone by the user. To modify, use run_lua.\n\
@@ -68,14 +67,25 @@ impl Tools {
         Self { hub, port, tool_router: Self::tool_router() + Self::status_router() }
     }
 
-    /// Runs a call on the Plugin and maps its reply to an MCP result.
+    /// Runs a call on the Plugin and maps its reply to an MCP result: the result (or error) text,
+    /// followed by one text block with the captured `print` lines when there are any.
     async fn forward(&self, tool: &str, args: Value) -> CallToolResult {
-        let text = |s: String| vec![ContentBlock::text(s)];
-        match self.hub.call(tool, args).await {
-            Err(e) => CallToolResult::error(text(e.to_string())),
-            Ok(reply) if reply["ok"] == true => CallToolResult::success(text(reply["result"].to_string())),
-            Ok(reply) => CallToolResult::error(text(reply["error"].as_str().unwrap_or("unknown plugin error").to_owned())),
+        let reply = match self.hub.call(tool, args).await {
+            Ok(reply) => reply,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e.to_string())]),
+        };
+        let ok = reply["ok"] == true;
+        let first = if ok {
+            reply["result"].to_string()
+        } else {
+            reply["error"].as_str().unwrap_or("unknown plugin error").to_owned()
+        };
+        let mut content = vec![ContentBlock::text(first)];
+        let lines: Vec<&str> = reply["output"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !lines.is_empty() {
+            content.push(ContentBlock::text(lines.join("\n")));
         }
+        if ok { CallToolResult::success(content) } else { CallToolResult::error(content) }
     }
 }
 
@@ -84,6 +94,11 @@ impl Tools {
     #[tool(description = RUN_LUA_DESCRIPTION)]
     async fn run_lua(&self, Parameters(RunLuaArgs { code }): Parameters<RunLuaArgs>) -> CallToolResult {
         self.forward("run_lua", json!({ "code": code })).await
+    }
+
+    #[tool(description = QUERY_LUA_DESCRIPTION)]
+    async fn query_lua(&self, Parameters(RunLuaArgs { code }): Parameters<RunLuaArgs>) -> CallToolResult {
+        self.forward("query_lua", json!({ "code": code })).await
     }
 }
 
