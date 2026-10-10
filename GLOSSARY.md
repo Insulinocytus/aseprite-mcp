@@ -25,11 +25,11 @@ Plugin 每次启动生成的随机密钥，Server 用它确认 Bridge 对端是�
 _Avoid_: password、API key
 
 **Curated Tool**:
-参数固定、对应 Plugin 内预置 Lua 实现的 MCP 工具。
+参数固定、行为由本项目预先实现的 MCP 工具（如 `get_image`、`get_status`）。
 _Avoid_: 白名单工具、高层工具
 
 **Raw Lua Tool**:
-把 MCP Client 提供的任意 Lua 代码交给 Plugin 执行的 MCP 工具（`run_lua`）。
+把 MCP Client 提供的任意 Lua 代码交给 Plugin 执行的 MCP 工具。分为写入用、每次调用构成一个撤销步骤的 `run_lua`，和只读、不进撤销历史的 `query_lua`。
 _Avoid_: eval、exec
 
 **Aseprite Lua Skill**:
