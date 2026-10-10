@@ -24,6 +24,7 @@ but never an undo step. Do not modify the document here; use run_lua for changes
 #[derive(Clone)]
 pub struct Tools {
     hub: Arc<Hub>,
+    port: u16,
     tool_router: ToolRouter<Self>,
 }
 
@@ -34,8 +35,8 @@ struct RunLuaArgs {
 }
 
 impl Tools {
-    pub fn new(hub: Arc<Hub>) -> Self {
-        Self { hub, tool_router: Self::tool_router() }
+    pub fn new(hub: Arc<Hub>, port: u16) -> Self {
+        Self { hub, port, tool_router: Self::tool_router() + Self::status_router() }
     }
 
     /// Runs a call on the Plugin and maps its reply to an MCP result: the result (or error) text,
@@ -70,6 +71,36 @@ impl Tools {
     #[tool(description = QUERY_LUA_DESCRIPTION)]
     async fn query_lua(&self, Parameters(RunLuaArgs { code }): Parameters<RunLuaArgs>) -> CallToolResult {
         self.forward("query_lua", json!({ "code": code })).await
+    }
+}
+
+const GET_STATUS_DESCRIPTION: &str = "Report whether Aseprite is connected, the Server version and port, \
+and, when connected, the Aseprite version and the open sprites (filename, size, color mode, active, \
+modified). Always succeeds: without Aseprite it explains why. Creates no undo step.";
+
+#[tool_router(router = status_router)]
+impl Tools {
+    #[tool(description = GET_STATUS_DESCRIPTION)]
+    async fn get_status(&self) -> CallToolResult {
+        let mut status = json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "port": self.port,
+            "bridge_connected": false,
+            "reason": crate::bridge::CallError::NotConnected.to_string(),
+        });
+        if self.hub.is_connected() {
+            match self.hub.call("status", json!({})).await {
+                Ok(reply) if reply["ok"] == true => {
+                    status["bridge_connected"] = json!(true);
+                    status.as_object_mut().unwrap().remove("reason");
+                    status["aseprite_version"] = reply["result"]["aseprite_version"].clone();
+                    status["sprites"] = reply["result"]["sprites"].clone();
+                }
+                Ok(reply) => status["reason"] = json!(reply["error"].as_str().unwrap_or("unknown plugin error")),
+                Err(e) => status["reason"] = json!(e.to_string()),
+            }
+        }
+        CallToolResult::success(vec![ContentBlock::text(status.to_string())])
     }
 }
 

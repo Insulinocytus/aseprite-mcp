@@ -172,10 +172,30 @@ test("serialization: nested, mixed and empty tables, userdata, nil", function()
   assert(out.ok == true and out.result == nil and out.id == 1)
 end)
 
+test("status lists sprites and adds no undo step", function()
+  local a = new_sprite()
+  a.filename = "first.aseprite"
+  local b = Sprite(8, 4, ColorMode.INDEXED)
+  app.transaction("baseline", function() b:newLayer() end) -- b is modified, layers: 2
+  local r = executor.execute("status", {})
+  assert(r.ok, tostring(r.error))
+  assert(type(r.result.aseprite_version) == "string" and #r.result.aseprite_version > 0)
+  assert(#r.result.sprites == 2, #r.result.sprites)
+  local by = {}
+  for _, e in ipairs(r.result.sprites) do by[e.filename:match("[^/\\]+$")] = e end
+  local ea = by["first.aseprite"]
+  assert(ea and ea.width == 16 and ea.height == 16 and ea.color_mode == "rgb" and ea.active == false and ea.modified == false)
+  local eb
+  for _, e in ipairs(r.result.sprites) do if e ~= ea then eb = e end end
+  assert(eb.width == 8 and eb.height == 4 and eb.color_mode == "indexed" and eb.active == true and eb.modified == true)
+  app.undo()
+  assert(layers(b) == 1, "status must not add an undo step; undo must revert the baseline, got " .. layers(b))
+end)
+
 for _, t in ipairs(tests) do
   local ok, err = pcall(t.fn)
   print((ok and "PASS " or "FAIL ") .. t.name .. (ok and "" or (": " .. tostring(err))))
   if not ok then error("test failed", 0) end -- script error => non-zero exit for the runner
-  while app.sprite do app.sprite:close() end
+  for i = #app.sprites, 1, -1 do app.sprites[i]:close() end
 end
 print("ALL PASS")

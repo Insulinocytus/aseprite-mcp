@@ -22,6 +22,12 @@ async fn connect_fake_plugin(server: &Server, token: &str) -> Result<(), tokio_t
         ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
         while let Some(Ok(Message::Text(text))) = ws.next().await {
             let req: Value = serde_json::from_str(&text).unwrap();
+            if req["tool"] == "status" {
+                let sprites = json!([{"filename": "a.aseprite", "width": 16, "height": 8, "color_mode": "rgb", "active": true, "modified": false}]);
+                let reply = json!({"id": req["id"], "ok": true, "result": {"aseprite_version": "1.3.test", "sprites": sprites}});
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+                continue;
+            }
             assert_eq!(req["tool"], "run_lua");
             let code = req["args"]["code"].as_str().unwrap();
             let reply = if code == "fail" {
@@ -157,5 +163,51 @@ async fn print_output_is_returned_with_errors_and_run_lua_too() {
     assert_eq!(result.is_error, Some(true));
     assert_eq!(text(&result), "boom");
     assert_eq!(result.content[1].as_text().unwrap().text, "line 1\nline 2");
+    server.shutdown();
+}
+
+async fn get_status(client: &RunningService<RoleClient, ClientConfig>) -> Value {
+    let result = client.call_tool(CallToolRequestParams::new("get_status")).await.unwrap();
+    assert_eq!(result.is_error, Some(false));
+    serde_json::from_str(text(&result)).unwrap()
+}
+
+#[tokio::test]
+async fn get_status_without_bridge_explains_why() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let status = get_status(&client).await;
+
+    assert_eq!(status["bridge_connected"], false);
+    assert_eq!(status["port"], server.addr.port());
+    assert_eq!(status["server_version"], env!("CARGO_PKG_VERSION"));
+    assert!(status["reason"].as_str().unwrap().contains("not connected"));
+    assert!(status.get("sprites").is_none());
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn get_status_with_bridge_lists_aseprite_version_and_sprites() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    connect_fake_plugin(&server, TOKEN).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let mut status = get_status(&client).await;
+    for _ in 0..50 {
+        if status["bridge_connected"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = get_status(&client).await;
+    }
+
+    assert_eq!(status["bridge_connected"], true);
+    assert!(status.get("reason").is_none());
+    assert_eq!(status["aseprite_version"], "1.3.test");
+    assert_eq!(
+        status["sprites"],
+        json!([{"filename": "a.aseprite", "width": 16, "height": 8, "color_mode": "rgb", "active": true, "modified": false}])
+    );
     server.shutdown();
 }
