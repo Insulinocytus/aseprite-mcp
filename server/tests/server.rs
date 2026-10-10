@@ -10,13 +10,20 @@ use rmcp::{
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 use serde_json::{Value, json};
-use std::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::time::{Duration, Instant};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 const TOKEN: &str = "test-token";
 
-/// Fake Plugin: answers `run_lua` with `{ok:true,result:<code>}` unless the code is "fail".
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Fake Plugin: answers `run_lua` with `{ok:true,result:<label><code>}` unless the code is "fail".
 async fn connect_fake_plugin(server: &Server, token: &str) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    fake_plugin(server, token, "").await
+}
+
+async fn fake_plugin(server: &Server, token: &str, label: &'static str) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     let (mut ws, _) = connect_async(format!("ws://{}/ws?token={token}", server.addr)).await?;
     tokio::spawn(async move {
         ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
@@ -27,7 +34,7 @@ async fn connect_fake_plugin(server: &Server, token: &str) -> Result<(), tokio_t
             let reply = if code == "fail" {
                 json!({"id": req["id"], "ok": false, "error": "boom\nstack traceback:\n\t[run_lua]:1"})
             } else {
-                json!({"id": req["id"], "ok": true, "result": code})
+                json!({"id": req["id"], "ok": true, "result": format!("{label}{code}")})
             };
             ws.send(Message::text(reply.to_string())).await.unwrap();
         }
@@ -97,5 +104,279 @@ async fn bridge_rejects_wrong_token_with_401() {
         tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 401),
         other => panic!("expected HTTP 401, got {other:?}"),
     }
+    server.shutdown();
+}
+
+async fn connect_raw(server: &Server) -> Ws {
+    let (mut ws, _) = connect_async(format!("ws://{}/ws?token={TOKEN}", server.addr)).await.unwrap();
+    ws.send(Message::text(json!({"type": "hello", "version": "test"}).to_string())).await.unwrap();
+    ws
+}
+
+async fn recv_call(ws: &mut Ws) -> Value {
+    loop {
+        match ws.next().await.unwrap().unwrap() {
+            Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+            _ => {}
+        }
+    }
+}
+
+async fn reply(ws: &mut Ws, call: &Value) {
+    let code = call["args"]["code"].as_str().unwrap();
+    ws.send(Message::text(json!({"id": call["id"], "ok": true, "result": code}).to_string())).await.unwrap();
+}
+
+/// One `run_lua` call without the not-connected retry.
+fn spawn_call(client: &RunningService<RoleClient, ClientConfig>, code: &'static str) -> tokio::task::JoinHandle<CallToolResult> {
+    let peer = client.peer().clone();
+    let args = json!({ "code": code }).as_object().unwrap().clone();
+    tokio::spawn(async move { peer.call_tool(CallToolRequestParams::new("run_lua").with_arguments(args)).await.unwrap() })
+}
+
+fn short_lifecycle(grace_ms: u64, watchdog_ms: u64) -> Config {
+    let mut c = Config::new(0, TOKEN);
+    c.grace = Duration::from_millis(grace_ms);
+    c.watchdog = Duration::from_millis(watchdog_ms);
+    c
+}
+
+async fn exits_within(server: Server, limit: Duration) -> Duration {
+    let t = Instant::now();
+    tokio::time::timeout(limit, server.wait()).await.expect("server did not exit").unwrap();
+    t.elapsed()
+}
+
+#[tokio::test]
+async fn exits_after_grace_when_no_bridge_ever_connects() {
+    let server = Server::start(short_lifecycle(600, 100)).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!server.is_finished(), "exited inside the grace period");
+
+    exits_within(server, Duration::from_secs(3)).await;
+}
+
+#[tokio::test]
+async fn exits_when_bridge_stays_gone_past_watchdog() {
+    let server = Server::start(short_lifecycle(200, 500)).await.unwrap();
+    let mut ws = connect_raw(&server).await;
+    tokio::time::sleep(Duration::from_millis(400)).await; // past grace, still connected
+    assert!(!server.is_finished());
+
+    ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!server.is_finished(), "exited before the watchdog period");
+
+    exits_within(server, Duration::from_secs(3)).await;
+}
+
+#[tokio::test]
+async fn bridge_reconnecting_within_watchdog_keeps_server_alive() {
+    let server = Server::start(short_lifecycle(200, 600)).await.unwrap();
+    let mut ws = connect_raw(&server).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ws = connect_raw(&server).await;
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(!server.is_finished());
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn bye_stops_server_immediately() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap(); // default 15 s grace / 10 s watchdog
+    let mut ws = connect_raw(&server).await;
+
+    ws.send(Message::text(json!({"type": "bye"}).to_string())).await.unwrap();
+
+    assert!(exits_within(server, Duration::from_secs(1)).await < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn bind_is_retried_until_the_port_frees_up_and_log_is_created_only_then() {
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = blocker.local_addr().unwrap().port();
+    let log = std::env::temp_dir().join(format!("aseprite-mcp-test-{}-{port}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let mut config = Config::new(port, TOKEN);
+    config.log = Some(log.clone());
+    config.bind_retry_interval = Duration::from_millis(50);
+    config.bind_retry_for = Duration::from_secs(5);
+    let start = tokio::spawn(Server::start(config));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!start.is_finished(), "gave up while still retrying");
+    assert!(!log.exists(), "log created before the bind succeeded");
+
+    drop(blocker);
+    let server = start.await.unwrap().unwrap();
+    assert!(log.exists());
+    server.shutdown();
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn bind_gives_up_after_retry_budget_without_creating_log() {
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = blocker.local_addr().unwrap().port();
+    let log = std::env::temp_dir().join(format!("aseprite-mcp-test-giveup-{}-{port}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let mut config = Config::new(port, TOKEN);
+    config.log = Some(log.clone());
+    config.bind_retry_interval = Duration::from_millis(50);
+    config.bind_retry_for = Duration::from_millis(300);
+
+    let t = Instant::now();
+    let result = Server::start(config).await;
+
+    assert!(result.is_err());
+    assert!(t.elapsed() >= Duration::from_millis(250), "gave up before the retry budget");
+    assert!(!log.exists());
+}
+
+#[tokio::test]
+async fn new_connection_replaces_the_old_bridge() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    fake_plugin(&server, TOKEN, "A:").await.unwrap();
+    let client = mcp_client(&server).await;
+    assert_eq!(text(&run_lua(&client, "x").await), r#""A:x""#);
+
+    fake_plugin(&server, TOKEN, "B:").await.unwrap();
+
+    let mut last = String::new();
+    for _ in 0..50 {
+        last = text(&run_lua(&client, "x").await).to_owned();
+        if last == r#""B:x""# {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(last, r#""B:x""#);
+    assert_eq!(text(&run_lua(&client, "y").await), r#""B:y""#); // the old connection ending does not unregister the new one
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn calls_reach_the_plugin_one_at_a_time_in_order() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let mut plugin = connect_raw(&server).await;
+    let client = mcp_client(&server).await;
+    let _ = run_lua_when_connected(&client, &mut plugin).await;
+
+    let a = spawn_call(&client, "a");
+    let first = recv_call(&mut plugin).await;
+    let b = spawn_call(&client, "b");
+
+    // The second call must stay queued while the first is unanswered.
+    let early = tokio::time::timeout(Duration::from_millis(300), recv_call(&mut plugin)).await;
+    assert!(early.is_err(), "second call was sent before the first was answered");
+
+    reply(&mut plugin, &first).await;
+    let second = recv_call(&mut plugin).await;
+    reply(&mut plugin, &second).await;
+
+    assert_eq!(first["args"]["code"], "a");
+    assert_eq!(second["args"]["code"], "b");
+    assert_eq!(text(&a.await.unwrap()), r#""a""#);
+    assert_eq!(text(&b.await.unwrap()), r#""b""#);
+    server.shutdown();
+}
+
+/// Waits until the raw fake Plugin is registered (first call gets through) by answering a probe call.
+async fn run_lua_when_connected(client: &RunningService<RoleClient, ClientConfig>, plugin: &mut Ws) -> CallToolResult {
+    let probe = tokio::spawn({
+        let client = client.peer().clone();
+        async move {
+            let args = json!({ "code": "probe" }).as_object().unwrap().clone();
+            for _ in 0..50 {
+                let r = client.call_tool(CallToolRequestParams::new("run_lua").with_arguments(args.clone())).await.unwrap();
+                if !text(&r).contains("not connected") {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("Bridge never connected");
+        }
+    });
+    let call = recv_call(plugin).await;
+    reply(plugin, &call).await;
+    probe.await.unwrap()
+}
+
+#[tokio::test]
+async fn timed_out_call_reports_it_and_its_late_reply_is_dropped() {
+    let mut config = Config::new(0, TOKEN);
+    config.call_timeout = Duration::from_millis(300);
+    let server = Server::start(config).await.unwrap();
+    let mut plugin = connect_raw(&server).await;
+    let client = mcp_client(&server).await;
+    let _ = run_lua_when_connected(&client, &mut plugin).await;
+
+    let slow = spawn_call(&client, "slow");
+    let slow_call = recv_call(&mut plugin).await;
+    let result = slow.await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("timed out") && text(&result).contains("may still be running"), "{}", text(&result));
+
+    // The late reply must not be mistaken for the next call's answer.
+    let next = spawn_call(&client, "next");
+    reply(&mut plugin, &slow_call).await;
+    let next_call = recv_call(&mut plugin).await;
+    reply(&mut plugin, &next_call).await;
+    assert_eq!(text(&next.await.unwrap()), r#""next""#);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn tool_call_without_bridge_fails_at_once_with_open_aseprite_hint() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let client = mcp_client(&server).await;
+
+    let t = Instant::now();
+    let result = spawn_call(&client, "x").await.unwrap();
+
+    assert!(t.elapsed() < Duration::from_secs(1));
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("not connected") && text(&result).contains("open Aseprite"), "{}", text(&result));
+    server.shutdown();
+}
+
+/// Status code of `GET /mcp` (or `/ws`) sent with the given raw `Host` / optional `Origin` headers.
+async fn http_status(server: &Server, path: &str, host: &str, origin: Option<&str>) -> u16 {
+    let mut s = TcpStream::connect(server.addr).await.unwrap();
+    let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).await.unwrap();
+    buf.split(' ').nth(1).unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn non_loopback_origin_or_host_is_refused() {
+    let server = Server::start(Config::new(0, TOKEN)).await.unwrap();
+    let local = format!("127.0.0.1:{}", server.addr.port());
+
+    for (host, origin) in [
+        (local.as_str(), None),
+        ("localhost", None),
+        (local.as_str(), Some("http://localhost:5173")),
+        (local.as_str(), Some("http://127.0.0.1")),
+    ] {
+        assert_ne!(http_status(&server, "/mcp", host, origin).await, 403, "{host} {origin:?} must pass");
+    }
+    for (host, origin) in [
+        ("evil.example", None),
+        ("evil.example:80", Some("http://127.0.0.1")),
+        (local.as_str(), Some("http://evil.example")),
+        (local.as_str(), Some("http://127.0.0.1.evil.example")),
+        (local.as_str(), Some("null")),
+    ] {
+        assert_eq!(http_status(&server, "/mcp", host, origin).await, 403, "{host} {origin:?} must be refused");
+    }
+    assert_eq!(http_status(&server, "/ws?token=test-token", &local, Some("http://evil.example")).await, 403);
     server.shutdown();
 }
