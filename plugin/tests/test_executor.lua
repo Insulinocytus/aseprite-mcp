@@ -280,6 +280,98 @@ test("status lists sprites and adds no undo step", function()
   assert(layers(b) == 1, "status must not add an undo step; undo must revert the baseline, got " .. layers(b))
 end)
 
+-- RGBA bytes of pixel (x, y) from a get_image reply, as "r,g,b,a".
+local function px(r, x, y)
+  local i = (y * r.width + x) * 4 + 1
+  return table.concat({ r.bytes:byte(i, i + 3) }, ",")
+end
+
+local function get_image(args) return executor.execute("get_image", args or {}) end
+
+test("get_image: rgb composite excludes hidden layers; a given layer renders alone, even hidden", function()
+  local s = Sprite(4, 2, ColorMode.RGB)
+  s.layers[1].name = "bottom"
+  s.cels[1].image:putPixel(0, 0, app.pixelColor.rgba(255, 0, 0, 255))
+  local top = s:newLayer()
+  top.name = "top"
+  local img = Image(2, 1, ColorMode.RGB)
+  img:putPixel(0, 0, app.pixelColor.rgba(0, 255, 0, 128))
+  s:newCel(top, 1, img, Point(2, 1))
+  local r = get_image()
+  assert(r.ok, tostring(r.error))
+  assert(r.width == 4 and r.height == 2 and #r.bytes == 32)
+  assert(px(r, 0, 0) == "255,0,0,255" and px(r, 2, 1) == "0,255,0,128" and px(r, 1, 0) == "0,0,0,0", px(r, 2, 1))
+  top.isVisible = false
+  r = get_image()
+  assert(px(r, 2, 1) == "0,0,0,0" and px(r, 0, 0) == "255,0,0,255", "hidden layer must not composite")
+  r = get_image { layer = "top" }
+  assert(px(r, 2, 1) == "0,255,0,128" and px(r, 0, 0) == "0,0,0,0", "layer alone, at its position")
+  r = get_image { layer = "bottom" }
+  assert(px(r, 0, 0) == "255,0,0,255" and px(r, 2, 1) == "0,0,0,0")
+end)
+
+test("get_image: grayscale", function()
+  local s = Sprite(2, 1, ColorMode.GRAY)
+  s.cels[1].image:putPixel(0, 0, app.pixelColor.graya(100, 255))
+  for _, args in ipairs { {}, { layer = s.layers[1].name } } do
+    local r = get_image(args)
+    assert(r.ok, tostring(r.error))
+    assert(px(r, 0, 0) == "100,100,100,255" and px(r, 1, 0) == "0,0,0,0", px(r, 0, 0))
+  end
+end)
+
+test("get_image: indexed applies the palette, transparent index is empty (composite and layer)", function()
+  local s = Sprite(2, 1, ColorMode.INDEXED)
+  s.palettes[1]:resize(3)
+  s.palettes[1]:setColor(1, Color { r = 10, g = 20, b = 30, a = 255 })
+  s.palettes[1]:setColor(2, Color { r = 200, g = 100, b = 50, a = 255 })
+  s.cels[1].image:putPixel(0, 0, 1)
+  s.cels[1].image:putPixel(1, 0, 2)
+  for _, args in ipairs { {}, { layer = s.layers[1].name } } do
+    local r = get_image(args)
+    assert(r.ok, tostring(r.error))
+    assert(px(r, 0, 0) == "10,20,30,255" and px(r, 1, 0) == "200,100,50,255", px(r, 0, 0))
+  end
+  s.cels[1].image:putPixel(0, 0, 0)
+  assert(px(get_image { layer = s.layers[1].name }, 0, 0) == "0,0,0,0")
+end)
+
+test("get_image: frame and sprite selection, errors", function()
+  local a = Sprite(2, 1, ColorMode.RGB)
+  a.filename = "pic.aseprite"
+  a.cels[1].image:putPixel(0, 0, app.pixelColor.rgba(1, 2, 3, 255))
+  local f2 = a:newEmptyFrame()
+  a:newCel(a.layers[1], f2, Image(2, 1, ColorMode.RGB), Point(0, 0))
+  a.cels[2].image:putPixel(1, 0, app.pixelColor.rgba(4, 5, 6, 255))
+  local b = Sprite(3, 3, ColorMode.RGB) -- active
+  local r = get_image { sprite = "pic.aseprite", frame = 2 }
+  assert(r.ok and r.width == 2 and px(r, 1, 0) == "4,5,6,255" and px(r, 0, 0) == "0,0,0,0", tostring(r.error))
+  assert(px(get_image { sprite = "pic.aseprite", frame = 1 }, 0, 0) == "1,2,3,255")
+  assert(get_image().width == 3, "default is the active sprite")
+  app.sprite = a
+  app.frame = a.frames[2]
+  assert(px(get_image(), 1, 0) == "4,5,6,255", "default frame is the current one")
+  r = get_image { frame = 3 }
+  assert(not r.ok and r.error:find("frame out of range", 1, true), tostring(r.error))
+  r = get_image { layer = "nope" }
+  assert(not r.ok and r.error:find("layer not found: nope", 1, true), tostring(r.error))
+  r = get_image { sprite = "nope.aseprite" }
+  assert(not r.ok and r.error:find("sprite not found", 1, true), tostring(r.error))
+end)
+
+test("get_image: no undo step; handle_message gives a compact header and the raw bytes", function()
+  local s = new_sprite()
+  app.transaction("baseline", function() s:newLayer() end) -- layers: 2
+  local header, bytes = executor.handle_message(json.encode { id = 5, tool = "get_image", args = {} })
+  local h = json.decode(header)
+  assert(h.id == 5 and h.ok == true and h.width == 16 and h.height == 16 and h.bytes == nil, header)
+  assert(not header:find("\n", 1, true) and #bytes == 16 * 16 * 4)
+  app.undo()
+  assert(layers(s) == 1, "get_image must not add an undo step, got " .. layers(s))
+  header, bytes = executor.handle_message(json.encode { id = 6, tool = "get_image", args = { layer = "nope" } })
+  assert(bytes == nil and json.decode(header).ok == false)
+end)
+
 for _, t in ipairs(tests) do
   local ok, err = pcall(t.fn)
   print((ok and "PASS " or "FAIL ") .. t.name .. (ok and "" or (": " .. tostring(err))))

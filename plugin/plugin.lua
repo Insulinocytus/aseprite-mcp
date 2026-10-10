@@ -19,8 +19,9 @@ local function make_token()
   return table.concat(parts)
 end
 
-local function send(text)
-  if ws then ws:sendText(text) end
+local function send(text, bytes)
+  if not ws then return end
+  if bytes then ws:sendBinary(text, "\n", bytes) else ws:sendText(text) end
 end
 
 local function refresh()
