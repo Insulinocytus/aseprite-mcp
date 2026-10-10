@@ -1,0 +1,10 @@
+{
+  "name": "aseprite-mcp",
+  "displayName": "Aseprite MCP",
+  "description": "Lets MCP clients drive the running Aseprite GUI; every write is one undo step.",
+  "version": "0.1.0",
+  "author": { "name": "Insulinocytus" },
+  "contributes": {
+    "scripts": [{ "path": "./plugin.lua" }]
+  }
+}
